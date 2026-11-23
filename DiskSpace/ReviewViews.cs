@@ -10,6 +10,7 @@ public partial class MainWindow
     private AppEntry[] reviewApps = [];
     private int reviewDays = 90;
     private bool showApps;
+    private bool onlyAppCandidates;
     private bool reviewLoading;
 
     private void LoadUsage()
@@ -38,11 +39,11 @@ public partial class MainWindow
         {
             var days = reviewDays;
             var summaries = scans.Values.ToArray();
-            await RunWork("Проверяем файлы и установленные приложения…", async token =>
+            var loaded = await RunWork("Проверяем файлы и установленные приложения…", async token =>
             {
                 if (demo)
                 {
-                    reviewFiles = summaries.SelectMany(scan => scan.AllFiles).Take(6)
+                    reviewFiles = summaries.SelectMany(scan => scan.AllFiles).Where(file => Recycle.PathRestriction(file.Path) is null).Take(6)
                         .Select((file, index) => file with { Changed = DateTime.UtcNow.AddDays(-days - (index + 1) * 17) }).ToArray();
                     reviewApps = [new("DaVinci Resolve", "Blackmagic Design", @"C:\Program Files\Blackmagic Design", null, 4L << 30, DateTime.Today.AddDays(-185)),
                         new("OBS Studio", "OBS Project", @"C:\Program Files\obs-studio", null, 340L << 20, DateTime.Today.AddDays(-75))];
@@ -53,6 +54,7 @@ public partial class MainWindow
                 reviewFiles = results.Files;
                 reviewApps = results.Apps;
             });
+            if (loaded) SetStatus($"Ревизия готова · файлов {reviewFiles?.Length ?? 0:N0} · приложений {reviewApps.Length:N0}");
             if (active == "Ревизия") Render();
         }
         finally { reviewLoading = false; }
@@ -93,14 +95,25 @@ public partial class MainWindow
         Page.Children.Add(bar);
         if (showApps)
         {
-            AddText(Page, $"Наблюдение с {usage.Since.ToLocalTime():dd.MM.yyyy}. Здесь показаны только процессы, которые приложение успело заметить. Дата установки может обновиться при обслуживании программы.",
+            AddText(Page, settings.Watch ? $"Наблюдение с {usage.Since.ToLocalTime():dd.MM.yyyy}. Запуск учитывается, если приложение успело увидеть процесс. Дата установки может обновиться при обслуживании."
+                : "Включите наблюдение, чтобы видеть замеченные запуски. Дата установки может обновиться при обслуживании.",
                 margin: new Thickness(0, 0, 0, 12));
+            var appActions = Actions();
+            appActions.Children.Add(ActionButton(onlyAppCandidates ? "Показать все" : "Кандидаты на удаление",
+                () => { onlyAppCandidates = !onlyAppCandidates; Render(); }, onlyAppCandidates));
+            Page.Children.Add(appActions);
+            var cutoff = DateTimeOffset.Now.AddDays(-90);
+            if (onlyAppCandidates)
+                AddText(Page, "Установлены или обновлены более 90 дней назад, свежих замеченных запусков нет",
+                    margin: new Thickness(0, 0, 0, 8));
             var rows = reviewApps.Select(app => new ReviewApp(app, LastObserved(app)))
+                .Where(row => !onlyAppCandidates || (row.App.Installed < cutoff.LocalDateTime && (row.Seen is null || row.Seen < cutoff)))
                 .OrderBy(row => row.Seen.HasValue).ThenBy(row => row.Seen)
                 .ThenBy(row => row.App.Installed ?? DateTime.MaxValue).ThenByDescending(row => row.App.Bytes).ToArray();
             var table = Table(rows, ("Приложение", "Name", 224), ("Размер", "Size", 96), ("Установка / обновление", "Installed", 158),
                 ("Запуск замечен", "Last", 132), ("Издатель", "Publisher", 148));
-            Page.Children.Add(table);
+            if (rows.Length > 0) Page.Children.Add(table);
+            else AddText(Page, "По этому фильтру приложений нет", margin: new Thickness(0, 0, 0, 8));
             Page.Children.Add(ActionButton("Удалить приложение в настройках Windows", () =>
             {
                 if (!demo)

@@ -20,7 +20,7 @@
                 </StackPanel>
                 <StackPanel DockPanel.Dock="Bottom" Margin="8,12,0,0">
                     <TextBlock x:Name="WatchLabel" Foreground="{DynamicResource Muted}" FontSize="12" TextWrapping="Wrap"/>
-                    <TextBlock Text="Версия 0.2.0" Foreground="{DynamicResource Muted}" FontSize="11" Margin="0,6,0,0"/>
+                    <TextBlock Text="Версия 0.2.1" Foreground="{DynamicResource Muted}" FontSize="11" Margin="0,6,0,0"/>
                 </StackPanel>
                 <StackPanel x:Name="Navigation"/>
             </DockPanel>

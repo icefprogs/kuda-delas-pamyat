@@ -1,7 +1,7 @@
 ﻿[Setup]
 AppId={{B9B850C9-10D5-427D-AEAA-6E4C91DA16DD}
 AppName=Куда делась память?
-AppVersion=0.2.0
+AppVersion=0.2.1
 DefaultDirName={localappdata}\Programs\KudaDelasPamyat
 DefaultGroupName=Куда делась память
 UninstallDisplayIcon={app}\DiskSpace.exe

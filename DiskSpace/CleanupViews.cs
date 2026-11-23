@@ -155,7 +155,7 @@ public partial class MainWindow
         AddText(estimate, previewAutomatic ? "Временные файлы и кеш шейдеров" : "Можно освободить");
         estimate.Children.Add(Text(candidates is null ? "—" : Bytes(plan.Sum(item => item.Bytes)), 42, bold: true));
         AddText(estimate, cleanupResult.Length == 0
-            ? candidates is null ? "Подготавливаем список при открытии раздела" : $"{plan.Length:N0} файлов в списке"
+            ? candidates is null ? "Подготавливаем список при открытии раздела" : $"Файлов в списке · {plan.Length:N0}"
             : cleanupResult, margin: new Thickness(0, 4, 12, 8));
         var actions = Actions();
         actions.Children.Add(ActionButton("Проверить заново", async () => await FindCleanup()));
@@ -186,7 +186,7 @@ public partial class MainWindow
         {
             var items = group.ToArray();
             var line = new DockPanel { Margin = new Thickness(0, 8, 0, 0) };
-            var selection = new CheckBox { Content = $"{group.Key} · {items.Length:N0} файлов",
+            var selection = new CheckBox { Content = $"{group.Key} · файлов {items.Length:N0}",
                 IsChecked = items.All(item => item.Selected) ? true : items.All(item => !item.Selected) ? false : null,
                 VerticalAlignment = VerticalAlignment.Center };
             selection.Click += (_, _) =>
