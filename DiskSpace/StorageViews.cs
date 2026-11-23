@@ -12,16 +12,16 @@ public partial class MainWindow
 {
     private void RenderOverview()
     {
-        Heading("Обзор дисков", "Свободное место на локальных дисках и последние изменения");
+        Heading("Хранилище", "Занятое и свободное место на локальных дисках");
         var ready = volumes.Where(volume => volume.Ready).ToArray();
         var capacity = ready.Sum(volume => volume.Capacity);
         var occupied = ready.Sum(volume => volume.Used);
         var free = ready.Sum(volume => volume.Free);
 
         var controls = Actions();
-        controls.Children.Add(ActionButton("Анализировать все диски", async () => await ScanVolumes(ready), true));
+        controls.Children.Add(ActionButton("Сканировать диски", async () => await ScanVolumes(ready), true));
         controls.Children.Add(ActionButton("Обновить", async () => { await RefreshVolumes(); SetStatus("Сводка обновлена"); }));
-        controls.Children.Add(ActionButton("Хватит ли места?", Planner));
+        controls.Children.Add(ActionButton("Перейти к очистке", () => Go("Очистка")));
         Page.Children.Add(controls);
 
         if (volumes.Length == 0)
@@ -34,19 +34,19 @@ public partial class MainWindow
 
         var layout = new Grid();
         layout.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(1, GridUnitType.Star) });
-        layout.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(1.2, GridUnitType.Star) });
+        layout.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(1, GridUnitType.Star) });
         var left = new StackPanel { Margin = new Thickness(0, 0, 12, 0) };
-        var donutLabel = Text("Всё хранилище", 17, bold: true);
+        var donutLabel = Text("Все тома", 18, bold: true);
         left.Children.Add(donutLabel);
         AddText(left, $"Общий объём {Bytes(capacity)}");
         var pieces = ready.Select((volume, index) => new RingPart($"{volume.Title} · {volume.Fill:0}% занято",
             volume.Used, new SolidColorBrush(Plot.Colors[index % Plot.Colors.Length]), () => OpenVolume(volume))).ToList();
         pieces.Add(new("Свободно на всех дисках · " + Bytes(free), free, Brush("Line"), () => { freeView = !freeView; Render(); }));
         var ring = new DiskRing(pieces, Bytes(occupied), "Свободно " + Bytes(free), Motion)
-        { Height = 242, MaxWidth = 320 };
+        { Height = 252, MaxWidth = 344 };
         AutomationProperties.SetName(ring, $"Занято {Bytes(occupied)}. Свободно {Bytes(free)}");
         left.Children.Add(ring);
-        left.Children.Add(ActionButton(freeView ? "Показать все диски" : "Где есть свободное место?", () => { freeView = !freeView; Render(); }));
+
         layout.Children.Add(left);
 
         var right = new StackPanel { Margin = new Thickness(8, 0, 0, 0) };
@@ -67,7 +67,7 @@ public partial class MainWindow
             var index = Array.IndexOf(ready, volume);
             title.Children.Add(new Border { Width = 9, Height = 9, CornerRadius = new CornerRadius(3),
                 Margin = new Thickness(0, 1, 8, 0), Background = index >= 0 ? new SolidColorBrush(Plot.Colors[index % Plot.Colors.Length]) : Brush("Line") });
-            var titleText = Text(volume.Title, 14, bold: true);
+            var titleText = Text(volume.Title, 15, bold: true);
             titleText.TextTrimming = TextTrimming.CharacterEllipsis;
             title.Children.Add(titleText);
             button.Content = title;
@@ -75,7 +75,7 @@ public partial class MainWindow
             panel.Children.Add(button);
             if (volume.Ready)
             {
-                AddText(panel, $"{Bytes(volume.Free)} свободно из {Bytes(volume.Capacity)}  ·  {volume.Fill:0}%",
+                AddText(panel, $"{Bytes(volume.Free)} свободно  /  {Bytes(volume.Capacity)}  ·  {volume.Fill:0}%",
                     volume.Free < 10L * 1024 * 1024 * 1024 || volume.Fill > 90 ? "Warning" : "Muted");
                 panel.Children.Add(new ProgressBar { Height = 4, Maximum = 100, Value = volume.Fill,
                     Margin = new Thickness(0, 6, 0, 4), Foreground = index >= 0 ? new SolidColorBrush(Plot.Colors[index % Plot.Colors.Length]) : Brush("Accent"),
@@ -87,6 +87,11 @@ public partial class MainWindow
                 AddText(panel, volume.Free >= need ? "Места достаточно" : $"Нужно освободить {Bytes(need - volume.Free)}", volume.Free >= need ? "Accent" : "Warning");
             right.Children.Add(panel);
         }
+        var volumeActions = Actions();
+        volumeActions.Margin = new Thickness(0, 12, 0, 0);
+        volumeActions.Children.Add(ActionButton(freeView ? "Все диски" : "По свободному месту", () => { freeView = !freeView; Render(); }));
+        volumeActions.Children.Add(ActionButton("Хватит ли места?", Planner));
+        right.Children.Add(volumeActions);
         Grid.SetColumn(right, 1);
         layout.Children.Add(right);
         Page.Children.Add(Card(layout));
@@ -202,12 +207,40 @@ public partial class MainWindow
         }
         table.MouseDoubleClick += (_, _) => OpenRow();
         table.KeyDown += (_, args) => { if (args.Key == Key.Enter) OpenRow(); };
-        Page.Children.Add(table);
         var extras = Actions();
         extras.Children.Add(ActionButton("Открыть выбранное", OpenRow));
         extras.Children.Add(ActionButton("Скопировать путь", () => { if (table.SelectedItem is DisplayFile row) Clipboard.SetText(row.Path); }));
         extras.Children.Add(ActionButton("Найти дубликаты", async () => await FindDuplicates(scan, open)));
+        var recycle = ActionButton("В корзину…", async () =>
+        {
+            if (table.SelectedItem is DisplayFile row) await RecycleItem(row.File);
+        });
+        recycle.IsEnabled = false;
+        table.SelectionChanged += (_, _) => recycle.IsEnabled = table.SelectedItem is DisplayFile;
+        extras.Children.Add(recycle);
+        if (!LocalStore.SamePath(open, disk.Root))
+        {
+            var folder = scan.Folders.FirstOrDefault(item => LocalStore.SamePath(item.Path, open))
+                ?? new FileRow(open, scan.Bytes, scan.Bytes, DateTime.MinValue, "Папки", true);
+            extras.Children.Add(ActionButton("Текущую папку в корзину…", async () =>
+            {
+                await RecycleItem(folder);
+                if (!demo && !Directory.Exists(open)) { selectedFolder = Path.GetDirectoryName(open); Render(); }
+            }));
+        }
         Page.Children.Add(extras);
+        var menu = new ContextMenu();
+        var moveItem = new MenuItem { Header = "В корзину…" };
+        moveItem.Click += async (_, _) => { if (table.SelectedItem is DisplayFile file) await RecycleItem(file.File); };
+        menu.Items.Add(moveItem);
+        menu.Opened += (_, _) => moveItem.IsEnabled = table.SelectedItem is DisplayFile;
+        table.ContextMenu = menu;
+        table.PreviewMouseRightButtonDown += (_, args) =>
+        {
+            if (args.OriginalSource is DependencyObject source && ItemsControl.ContainerFromElement(table, source) is DataGridRow target)
+                table.SelectedItem = target.Item;
+        };
+        Page.Children.Add(table);
         var unassigned = LocalStore.SamePath(scan.Scope, disk.Root) && disk.Used > scan.Bytes ? $" · не распределено {Bytes(disk.Used - scan.Bytes)}" : "";
         AddText(Page, $"Учтено {Bytes(scan.Bytes)} · {scan.Files:N0} файлов · {scan.Skipped:N0} пропусков{unassigned}");
         if (scan.Truncated) AddText(Page, "Достигнут предел детализации. Просканируйте отдельную папку для полного списка.", "Warning");

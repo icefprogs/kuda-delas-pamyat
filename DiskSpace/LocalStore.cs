@@ -6,7 +6,7 @@ internal sealed record FolderSize(string Path, long Bytes);
 internal sealed record Snapshot(string VolumeId, string Scope, DateTimeOffset Time, long Free, long Capacity, int Skipped, FolderSize[] Folders, string? Mark);
 internal sealed record CleanupLog(DateTimeOffset Time, string Path, string Status, long Bytes);
 internal sealed record Preferences(bool Watch = false, bool Notify = true, bool AutoClean = false, bool Animate = true,
-    int MinimumAge = 7, int LimitMb = 512, string Theme = "Системная", string[]? Excluded = null);
+    int MinimumAge = 7, int LimitMb = 512, string Theme = "Системная", string[]? Excluded = null, int CleanupConsent = 0);
 
 internal sealed class LocalStore
 {

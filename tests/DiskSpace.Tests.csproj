@@ -8,6 +8,10 @@
   <ItemGroup>
     <Compile Include="../DiskSpace/DiskScanner.cs" Link="DiskScanner.cs" />
     <Compile Include="../DiskSpace/Cleanup.cs" Link="Cleanup.cs" />
+    <Compile Include="../DiskSpace/CleanupRules.cs" Link="CleanupRules.cs" />
+    <Compile Include="../DiskSpace/CleanupSchedule.cs" Link="CleanupSchedule.cs" />
+    <Compile Include="../DiskSpace/Recycle.cs" Link="Recycle.cs" />
+    <Compile Include="../DiskSpace/Review.cs" Link="Review.cs" />
     <Compile Include="../DiskSpace/LocalStore.cs" Link="LocalStore.cs" />
     <Compile Include="../DiskSpace/Duplicates.cs" Link="Duplicates.cs" />
   </ItemGroup>

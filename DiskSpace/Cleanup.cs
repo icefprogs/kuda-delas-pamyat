@@ -6,10 +6,12 @@ using Microsoft.Win32.SafeHandles;
 
 namespace DiskSpace;
 
-internal sealed record Candidate(string Path, long Bytes, long Logical, DateTime Changed, string Reason, bool Demo = false, ulong FileId = 0)
+internal sealed record Candidate(string Path, long Bytes, long Logical, DateTime Changed, string Reason, bool Demo = false, ulong FileId = 0, CleanupRule? Rule = null)
 {
     public string Name => System.IO.Path.GetFileName(Path);
     public bool Selected { get; set; } = true;
+    public string Category => Rule?.Category ?? "Временные файлы";
+    public bool Automatic => Rule?.Automatic ?? true;
 }
 
 internal static class Cleanup
@@ -20,22 +22,43 @@ internal static class Cleanup
     private const FileAttributes Disallowed = FileAttributes.ReparsePoint | FileAttributes.Offline | FileAttributes.ReadOnly
         | FileAttributes.System | FileAttributes.Directory;
 
-    public static Candidate[] Find(int days, string[] exclusions, CancellationToken token)
+    public static Candidate[] Find(int days, string[] exclusions, CancellationToken token, bool automatic = false)
+    {
+        return FindForRules(CleanupRules.Get(), days, exclusions, token, automatic);
+    }
+
+    internal static Candidate[] FindForRules(IEnumerable<CleanupRule> rules, int days, string[] exclusions, CancellationToken token, bool automatic = false)
     {
         var limit = DateTime.UtcNow.AddDays(-days);
-        var root = TempRoot;
-        if (!IsPlainDirectory(root)) return [];
+        var options = new EnumerationOptions
+        {
+            RecurseSubdirectories = true, IgnoreInaccessible = true,
+            AttributesToSkip = FileAttributes.ReparsePoint | FileAttributes.Offline | FileAttributes.System
+        };
         var list = new List<Candidate>();
-        foreach (var path in Directory.EnumerateFiles(root, "*.tmp", SearchOption.TopDirectoryOnly))
+        var seen = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        foreach (var rule in rules)
         {
             token.ThrowIfCancellationRequested();
-            if (exclusions.Any(parent => LocalStore.IsUnder(path, parent))) continue;
+            if ((automatic && !rule.Automatic) || !IsPlainDirectory(rule.Root)) continue;
+            var cutoff = rule.Kind == CleanupKind.Browser ? DateTime.UtcNow.AddHours(-1) : limit;
             try
             {
-                var file = new FileInfo(path);
-                if ((file.Attributes & Disallowed) != 0 || file.LastWriteTimeUtc >= limit
-                    || !NativeFiles.Measure(path, out var allocated, out var links, out var id) || links != 1) continue;
-                list.Add(new(path, allocated, file.Length, file.LastWriteTimeUtc, "Файл .tmp в папке Temp пользователя старше порога", FileId: id));
+                foreach (var file in new DirectoryInfo(rule.Root).EnumerateFiles("*", options))
+                {
+                    token.ThrowIfCancellationRequested();
+                    if (!rule.Accepts(file.FullName) || !seen.Add(file.FullName)
+                        || exclusions.Any(parent => LocalStore.IsUnder(file.FullName, parent))) continue;
+                    try
+                    {
+                        if ((file.Attributes & Disallowed) != 0 || file.LastWriteTimeUtc >= cutoff
+                            || !NativeFiles.Measure(file.FullName, out var allocated, out var links, out var id) || links != 1) continue;
+                        var reason = rule.Process is null ? $"Старше {days} дн." : "Кеш · закройте браузер перед очисткой";
+                        list.Add(new(file.FullName, allocated, file.Length, file.LastWriteTimeUtc, reason, FileId: id, Rule: rule)
+                        { Selected = rule.Kind != CleanupKind.Crash });
+                    }
+                    catch (Exception error) when (error is IOException or UnauthorizedAccessException) { }
+                }
             }
             catch (Exception error) when (error is IOException or UnauthorizedAccessException) { }
         }
@@ -46,11 +69,12 @@ internal static class Cleanup
     {
         var time = DateTimeOffset.Now;
         if (item.Demo) return new(time, item.Path, "Демо · имитация", item.Bytes);
-        var root = TempRoot;
-        if (!LocalStore.SamePath(Path.GetDirectoryName(item.Path), root) || !IsPlainDirectory(root)
-            || !string.Equals(Path.GetExtension(item.Path), ".tmp", StringComparison.OrdinalIgnoreCase)
-            || exclusions.Any(parent => LocalStore.IsUnder(item.Path, parent)))
+        var rule = item.Rule ?? new CleanupRule(TempRoot, CleanupKind.Temp, "Временные файлы");
+        if (!rule.Accepts(item.Path) || Path.GetDirectoryName(item.Path) is not { } parentPath
+            || !IsPlainDirectory(parentPath) || exclusions.Any(parent => LocalStore.IsUnder(item.Path, parent)))
             return new(time, item.Path, "За пределами правил", 0);
+        if (CleanupRules.Running(rule.Process)) return new(time, item.Path, "Закройте браузер", 0);
+        var cutoff = rule.Kind == CleanupKind.Browser ? DateTime.UtcNow.AddHours(-1) : DateTime.UtcNow.AddDays(-days);
 
         try
         {
@@ -66,7 +90,7 @@ internal static class Cleanup
             var size = ((long)info.SizeHigh << 32) | info.SizeLow;
             var write = DateTime.FromFileTimeUtc(((long)info.WriteHigh << 32) | info.WriteLow);
             var id = ((ulong)info.FileIndexHigh << 32) | info.FileIndexLow;
-            if (id != item.FileId || write != item.Changed || size != item.Logical || write > DateTime.UtcNow.AddDays(-days))
+            if (id != item.FileId || write != item.Changed || size != item.Logical || write > cutoff)
                 return new(time, item.Path, "Размер, дата или правило изменились", 0);
             byte remove = 1;
             if (!SetFileInformationByHandle(file, 4, ref remove, 1))

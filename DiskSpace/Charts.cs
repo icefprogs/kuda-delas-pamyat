@@ -9,8 +9,8 @@ internal sealed record RingPart(string Label, long Bytes, Brush Brush, Action? O
 
 internal static class Plot
 {
-    public static readonly Color[] Colors = [Color.FromRgb(114, 217, 198), Color.FromRgb(129, 171, 251),
-        Color.FromRgb(249, 194, 124), Color.FromRgb(190, 155, 242), Color.FromRgb(164, 211, 121), Color.FromRgb(242, 155, 176)];
+    public static readonly Color[] Colors = [Color.FromRgb(108, 160, 228), Color.FromRgb(112, 190, 179),
+        Color.FromRgb(229, 180, 111), Color.FromRgb(151, 166, 195), Color.FromRgb(161, 189, 129), Color.FromRgb(206, 149, 136)];
 
     public static Brush Brush(FrameworkElement owner, string key) => (Brush)owner.FindResource(key);
     public static FormattedText Text(FrameworkElement owner, string text, double size, string brush, FontWeight? weight = null)
@@ -51,12 +51,12 @@ internal sealed class DiskRing(IReadOnlyList<RingPart> parts, string used, strin
         {
             var part = parts[index];
             var slice = 360 * part.Bytes / total;
-            var end = Math.Min(start + slice - 1.4, 360 * Reveal);
+            var end = Math.Min(start + slice - 1.8, 360 * Reveal);
             if (end > start) Arc(context, center, radius, start + .7, end, part.Brush, index == active ? 25 : 19);
             start += slice;
         }
-        Plot.Center(context, this, "Занято", 13, "Muted", center.X, center.Y - 33);
-        Plot.Center(context, this, used, 33, "Text", center.X, center.Y - 4, true);
+        Plot.Center(context, this, "Занято", 13, "Muted", center.X, center.Y - 38);
+        Plot.Center(context, this, used, 38, "Text", center.X, center.Y - 4, true);
         Plot.Center(context, this, free, 13, "Muted", center.X, center.Y + 30);
     }
 

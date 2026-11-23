@@ -6,21 +6,21 @@
     Background="{DynamicResource AppBg}" Foreground="{DynamicResource Text}">
     <Grid>
         <Grid.ColumnDefinitions>
-            <ColumnDefinition Width="216"/>
+            <ColumnDefinition Width="208"/>
             <ColumnDefinition Width="*"/>
         </Grid.ColumnDefinitions>
         <Border Background="{DynamicResource Side}" BorderBrush="{DynamicResource Line}" BorderThickness="0,0,1,0">
-            <DockPanel Margin="14,19,14,14">
-                <StackPanel DockPanel.Dock="Top" Margin="8,1,0,30">
-                    <Border Width="32" Height="32" HorizontalAlignment="Left" CornerRadius="9" Background="{DynamicResource Accent}">
+            <DockPanel Margin="16,20,16,16">
+                <StackPanel DockPanel.Dock="Top" Margin="8,0,0,28">
+                    <Border Width="32" Height="32" HorizontalAlignment="Left" CornerRadius="8" Background="{DynamicResource Raised}">
                         <TextBlock Text="&#xE7B8;" FontFamily="Segoe Fluent Icons" FontSize="18" HorizontalAlignment="Center"
-                                   VerticalAlignment="Center" Foreground="{DynamicResource OnAccent}"/>
+                                   VerticalAlignment="Center" Foreground="{DynamicResource Accent}"/>
                     </Border>
                     <TextBlock Text="Куда делась&#xA;память?" FontSize="20" FontWeight="SemiBold" Margin="0,9,0,0"/>
                 </StackPanel>
                 <StackPanel DockPanel.Dock="Bottom" Margin="8,12,0,0">
                     <TextBlock x:Name="WatchLabel" Foreground="{DynamicResource Muted}" FontSize="12" TextWrapping="Wrap"/>
-                    <TextBlock Text="Версия 0.1.0" Foreground="{DynamicResource Muted}" FontSize="11" Margin="0,6,0,0"/>
+                    <TextBlock Text="Версия 0.2.0" Foreground="{DynamicResource Muted}" FontSize="11" Margin="0,6,0,0"/>
                 </StackPanel>
                 <StackPanel x:Name="Navigation"/>
             </DockPanel>
@@ -31,15 +31,15 @@
                 <RowDefinition Height="*"/>
                 <RowDefinition Height="Auto"/>
             </Grid.RowDefinitions>
-            <Grid Margin="26,15,24,0">
+            <Grid Margin="28,16,24,0">
                 <Grid.ColumnDefinitions><ColumnDefinition Width="*"/><ColumnDefinition Width="Auto"/></Grid.ColumnDefinitions>
                 <TextBlock x:Name="ContextLabel" VerticalAlignment="Center" Foreground="{DynamicResource Muted}"/>
                 <Button Grid.Column="1" x:Name="GlobalSearch" Content="Поиск   Ctrl+K" Click="SearchClick"/>
             </Grid>
             <ScrollViewer Grid.Row="1" x:Name="Viewport" VerticalScrollBarVisibility="Auto" HorizontalScrollBarVisibility="Disabled">
-                <StackPanel x:Name="Page" Margin="26,17,24,18"/>
+                <StackPanel x:Name="Page" Margin="28,16,24,20"/>
             </ScrollViewer>
-            <Border Grid.Row="2" BorderBrush="{DynamicResource Line}" BorderThickness="0,1,0,0" Background="{DynamicResource Side}" Padding="26,8,24,8">
+            <Border Grid.Row="2" BorderBrush="{DynamicResource Line}" BorderThickness="0,1,0,0" Background="{DynamicResource Side}" Padding="28,8,24,8">
                 <DockPanel>
                     <StackPanel Orientation="Horizontal" DockPanel.Dock="Right">
                         <Button x:Name="PauseButton" Content="Пауза" Click="TogglePause" Visibility="Collapsed" Margin="0,0,6,0"/>

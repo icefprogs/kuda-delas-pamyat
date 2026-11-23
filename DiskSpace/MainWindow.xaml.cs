@@ -30,6 +30,12 @@ public partial class MainWindow : Window
     private DuplicateRow[]? duplicateRows;
     private CancellationTokenSource? current;
     private DateTimeOffset lastBackground;
+    private DateTimeOffset lastCleanupCheck;
+    private CleanupSchedule autoReport;
+    private bool cleanupOpening;
+    private bool cleanupRulesChanged;
+    private CancellationTokenSource? backgroundScan;
+    private bool backgroundAnalysis;
     private string active = "Обзор";
     private string? selectedVolume;
     private string? selectedFolder;
@@ -53,12 +59,15 @@ public partial class MainWindow : Window
         InitializeComponent();
         demo = Environment.GetCommandLineArgs().Contains("--demo");
         var previous = demo ? new Preferences() : store.Read("settings.json", new Preferences());
-        settings = previous with { MinimumAge = Math.Clamp(previous.MinimumAge, 7, 365), LimitMb = Math.Clamp(previous.LimitMb, 1, 10240) };
+        cleanupRulesChanged = previous.AutoClean && previous.CleanupConsent < 2;
+        settings = previous with { AutoClean = previous.AutoClean && !cleanupRulesChanged, MinimumAge = Math.Clamp(previous.MinimumAge, 1, 365), LimitMb = Math.Clamp(previous.LimitMb, 1, 10240) };
         history = demo ? [] : store.Read("history.json", new List<Snapshot>());
         journal = demo ? [] : store.Read("cleanup.json", new List<CleanupLog>());
         lastBackground = demo ? DateTimeOffset.MinValue : store.Read("background.json", DateTimeOffset.MinValue);
+        autoReport = demo ? CleanupSchedule.Empty : store.Read("auto-cleanup.json", CleanupSchedule.Empty);
+        LoadUsage();
         ApplyTheme();
-        foreach (var (title, icon) in new[] { ("Обзор", "\uE80F"), ("Анализ", "\uE8B7"), ("История", "\uE9D9"), ("Очистка", "\uE74D"), ("Настройки", "\uE713") })
+        foreach (var (title, icon) in new[] { ("Обзор", "\uE80F"), ("Анализ", "\uE8B7"), ("История", "\uE9D9"), ("Очистка", "\uE74D"), ("Ревизия", "\uE8A9"), ("Настройки", "\uE713") })
         {
             var row = Row();
             row.Children.Add(new TextBlock { Text = icon, FontFamily = new FontFamily("Segoe Fluent Icons"), Width = 30, VerticalAlignment = VerticalAlignment.Center, FontSize = 16 });
@@ -67,7 +76,7 @@ public partial class MainWindow : Window
             AutomationProperties.SetName(button, title);
             button.Content = row;
             button.HorizontalContentAlignment = HorizontalAlignment.Left;
-            button.Margin = new Thickness(0, 0, 0, 5);
+            button.Margin = new Thickness(0, 0, 0, 4);
             nav.Add((title, button));
             Navigation.Children.Add(button);
         }
@@ -82,7 +91,7 @@ public partial class MainWindow : Window
         {
             if (demo) SetupDemo();
             Render();
-            SetStatus(store.Error ?? "Готово к анализу");
+            SetStatus(store.Error ?? (cleanupRulesChanged ? "Для автоочистки подтвердите обновлённые правила" : "Готово к анализу"));
             if (!demo) await RefreshVolumes();
             if (Environment.GetCommandLineArgs().Contains("--tray") && settings.Watch && !demo) HideToTray();
             timer.Start();
@@ -123,31 +132,48 @@ public partial class MainWindow : Window
         }
     }
 
+
     private async Task BackgroundTick()
     {
-        if (demo || current is not null || ticking) return;
+        if (demo || ticking) return;
         ticking = true;
         try
         {
+            await ObserveAppsAsync();
+            if (current is not null) return;
+            if (settings.Watch && Idle(60_000))
+            {
+                var now = DateTimeOffset.Now;
+                if (settings.AutoClean && autoReport.Due(now))
+                    await RunAutoCleanup(force: false);
+                else if (!settings.AutoClean && now - lastCleanupCheck >= TimeSpan.FromHours(6))
+                {
+                    lastCleanupCheck = now;
+                    if (await FindCleanup(automatic: true) && settings.Notify && candidates is { Length: > 0 })
+                        Notify($"Можно освободить до {Bytes(candidates.Sum(item => item.Bytes))}");
+                }
+            }
+
+            if (current is not null) return;
             if (active == "Обзор" || settings.Watch) await RefreshVolumes();
-            if (!settings.Watch || !Idle() || Forms.SystemInformation.PowerStatus.PowerLineStatus != Forms.PowerLineStatus.Online) return;
+            if (!settings.Watch || !Idle() || active is "Очистка" or "Ревизия" || current is not null
+                || Forms.SystemInformation.PowerStatus.PowerLineStatus != Forms.PowerLineStatus.Online) return;
             var low = volumes.FirstOrDefault(v => v.Ready && (v.Fill > 90 || v.Free < 10L * 1024 * 1024 * 1024));
-            var previous = DateTimeOffset.Now - lastBackground;
-            if (previous < TimeSpan.FromHours(low is not null ? 6 : 24)) return;
+            if (DateTimeOffset.Now - lastBackground < TimeSpan.FromHours(low is not null ? 6 : 24)) return;
             lastBackground = DateTimeOffset.Now;
             TrySave(() => store.Save("background.json", lastBackground));
-            if (!await ScanVolumes(volumes.Where(v => v.Ready).ToArray(), automatic: true) || !settings.Watch || !Idle()) return;
-            if (!await FindCleanup(automatic: true)) return;
-            if (settings.AutoClean && candidates is { Length: > 0 })
-                await ExecuteCleanup(candidates, automatic: true);
-            else if (settings.Notify && (low is not null || candidates is { Length: > 0 }))
-            {
-                var message = low is null ? "Есть временные файлы для просмотра." : $"{low.Title} · свободно {Bytes(low.Free)}";
-                tray.Visible = true;
-                tray.ShowBalloonTip(5000, "Куда делась память?", message, Forms.ToolTipIcon.Info);
-            }
+            if (low is not null && settings.Notify) Notify($"{low.Title} · свободно {Bytes(low.Free)}");
+            backgroundAnalysis = true;
+            try { await ScanVolumes(volumes.Where(v => v.Ready).ToArray(), automatic: true); }
+            finally { backgroundAnalysis = false; }
         }
         finally { ticking = false; }
+    }
+
+    private void Notify(string message)
+    {
+        tray.Visible = true;
+        tray.ShowBalloonTip(5000, "Куда делась память?", message, Forms.ToolTipIcon.Info);
     }
 
     private bool ticking;
@@ -185,6 +211,7 @@ public partial class MainWindow : Window
         if (current is not null) { SetStatus("Дождитесь завершения текущей операции"); return false; }
         using var cancel = new CancellationTokenSource();
         current = cancel;
+        if (backgroundAnalysis) backgroundScan = cancel;
         pause.Set();
         SetStatus(label);
         CancelButton.Visibility = Visibility.Visible;
@@ -201,6 +228,7 @@ public partial class MainWindow : Window
         finally
         {
             current = null;
+            if (ReferenceEquals(backgroundScan, cancel)) backgroundScan = null;
             CancelButton.Visibility = Visibility.Collapsed;
             PauseButton.Visibility = Visibility.Collapsed;
         }
@@ -239,10 +267,13 @@ public partial class MainWindow : Window
 
     private void Go(string page, bool modeChanged = false)
     {
+        if (page == "Очистка" && backgroundAnalysis) backgroundScan?.Cancel();
         var changed = active != page || modeChanged;
         active = page;
         Render(changed);
         if (changed) Viewport.ScrollToTop();
+        if (page == "Очистка" && (candidates is null || previewAutomatic) && !cleanupOpening) _ = OpenCleanupAsync();
+        if (page == "Ревизия" && reviewFiles is null) _ = LoadReviewAsync();
     }
 
     private void OpenVolume(Volume volume)
@@ -271,6 +302,7 @@ public partial class MainWindow : Window
             case "Анализ": RenderAnalysis(); break;
             case "История": RenderHistory(); break;
             case "Очистка": RenderCleanup(); break;
+            case "Ревизия": RenderReview(); break;
             case "Настройки": RenderSettings(); break;
             case "Поиск": RenderSearch(); break;
             case "Дубликаты": RenderDuplicates(); break;
@@ -298,8 +330,8 @@ public partial class MainWindow : Window
     {
         var dark = settings.Theme == "Тёмная" || (settings.Theme == "Системная" && IsSystemDark());
         string[] keys = ["AppBg", "Side", "Card", "Raised", "Line", "Text", "Muted", "Accent", "OnAccent", "Hover", "Warning"];
-        string[] values = dark ? ["#171A20", "#13161C", "#20242C", "#282D36", "#383E49", "#F2F5F7", "#AEB8C5", "#77DBC7", "#092C28", "#35424C", "#EEC383"]
-            : ["#F3F6F7", "#EBEFF2", "#FFFFFF", "#F3F6F7", "#D6DEE3", "#152632", "#495C67", "#006B60", "#FFFFFF", "#DCEEEA", "#74430E"];
+        string[] values = dark ? ["#18191B", "#121315", "#212225", "#292A2E", "#3A3B40", "#F1F1F2", "#B1B3B9", "#A8CEFF", "#123059", "#303743", "#F0C489"]
+            : ["#F2F3F5", "#EBEEF2", "#FCFCFD", "#F2F4F7", "#D9DCE1", "#1A2030", "#515A68", "#234E83", "#FFFFFF", "#DCE7F6", "#7D4B0B"];
         for (var i = 0; i < keys.Length; i++)
             Application.Current.Resources[keys[i]] = new SolidColorBrush((Color)ColorConverter.ConvertFromString(values[i]));
         if (SystemParameters.HighContrast)
@@ -330,10 +362,10 @@ public partial class MainWindow : Window
         DwmSetWindowAttribute(handle, 38, ref mica, 4);
     }
 
-    private static bool Idle()
+    private static bool Idle(uint threshold = 180_000)
     {
         var info = new LastInput { Size = 8 };
-        return GetLastInputInfo(ref info) && unchecked((uint)Environment.TickCount - info.Time) > 180_000;
+        return GetLastInputInfo(ref info) && unchecked((uint)Environment.TickCount - info.Time) > threshold;
     }
 
     [StructLayout(LayoutKind.Sequential)]
@@ -390,7 +422,7 @@ public partial class MainWindow : Window
     private Border Card(UIElement content, Thickness? padding = null)
     {
         return new Border { Background = Brush("Card"), BorderBrush = Brush("Line"), BorderThickness = new Thickness(1),
-            CornerRadius = new CornerRadius(9), Padding = padding ?? new Thickness(16), Child = content, Margin = new Thickness(0, 0, 0, 14) };
+            CornerRadius = new CornerRadius(8), Padding = padding ?? new Thickness(20), Child = content, Margin = new Thickness(0, 0, 0, 16) };
     }
 
     private void Heading(string title, string subtitle)

@@ -6,65 +6,114 @@ namespace DiskSpace;
 
 public partial class MainWindow
 {
+
+    private bool previewAutomatic;
+    private string cleanupResult = "";
+    private (long Bytes, long Count) recycleContents;
+
+    private async Task OpenCleanupAsync()
+    {
+        cleanupOpening = true;
+        try
+        {
+            while (backgroundScan is not null && active == "Очистка") await Task.Delay(120);
+            if (active == "Очистка" && current is null) await FindCleanup();
+        }
+        finally { cleanupOpening = false; }
+    }
+
     private async Task<bool> FindCleanup(bool automatic = false)
     {
-        var ok = await RunWork("Ищем временные файлы…", async token =>
+        var days = settings.MinimumAge;
+        var exclusions = Exclusions;
+        var ok = await RunWork("Проверяем временные файлы и кеши…", async token =>
         {
-            if (demo) { candidates = DemoCandidates(); return; }
-            candidates = await Task.Run(() => Cleanup.Find(settings.MinimumAge, Exclusions, token), token);
+            if (demo) { candidates = DemoCandidates(); recycleContents = (188L * 1024 * 1024, 7); return; }
+            var result = await Task.Run(() => (Candidates: Cleanup.Find(days, exclusions, token, automatic), Recycle: Recycle.Count()), token);
+            candidates = result.Candidates;
+            recycleContents = result.Recycle;
+            previewAutomatic = automatic;
         });
-        if (ok && !automatic) SetStatus($"Кандидатов: {candidates?.Length ?? 0:N0}");
+        if (ok && !automatic) SetStatus(candidates?.Length > 0 ? $"Найдено {candidates.Length:N0} кандидатов" : "По этим правилам кандидатов нет");
         if (active == "Очистка" || active == "Обзор") Render();
         return ok;
     }
 
-    private async Task ExecuteCleanup(Candidate[] plan, bool automatic = false)
+    private async Task RunAutoCleanup(bool force)
     {
-        if (plan.Length == 0) { SetStatus("Выберите временные файлы"); return; }
-        if (!automatic && MessageBox.Show(this,
-            $"Удалить {plan.Length:N0} временных файлов ({Bytes(plan.Sum(item => item.Bytes))}) безвозвратно?",
-            "Подтвердите очистку", MessageBoxButton.YesNo, MessageBoxImage.Warning, MessageBoxResult.No) != MessageBoxResult.Yes) return;
+        if (!settings.AutoClean || current is not null) return;
+        if (!force && !Idle(60_000)) return;
+        if (!await FindCleanup(automatic: true)) return;
+        var plan = candidates?.Where(item => item.Automatic).ToArray() ?? [];
+        if (plan.Length == 0)
+        {
+            autoReport = new(DateTimeOffset.Now, 0, 0, "Подходящих файлов нет");
+            TrySave(() => store.Save("auto-cleanup.json", autoReport));
+            if (active == "Очистка" || active == "Настройки") Render();
+            return;
+        }
+        await ExecuteCleanup(plan, automatic: true, force: force);
+    }
 
-        long removed = 0;
+    private async Task ExecuteCleanup(Candidate[] plan, bool automatic = false, bool force = false)
+    {
+        if (current is not null) { SetStatus("Сначала завершите текущую операцию"); return; }
+        if (plan.Length == 0) { SetStatus("Отметьте файлы для очистки"); return; }
+        if (!automatic && MessageBox.Show(this,
+            $"Удалить {plan.Length:N0} файлов кеша и временных данных безвозвратно?\nОбъём по результатам проверки — {Bytes(plan.Sum(item => item.Bytes))}.",
+            "Очистка", MessageBoxButton.YesNo, MessageBoxImage.Warning, MessageBoxResult.No) != MessageBoxResult.Yes) return;
+
         var before = volumes.Where(volume => volume.Ready).ToDictionary(volume => volume.Id, volume => volume.Free);
-        var limit = (long)settings.LimitMb * 1024 * 1024;
+        var limit = automatic ? (long)settings.LimitMb * 1024 * 1024 : long.MaxValue;
         var days = settings.MinimumAge;
         var exclusions = Exclusions;
+        var logs = new List<CleanupLog>();
+        var progress = new Progress<int>(done => SetStatus($"Очистка · обработано {done:N0} из {plan.Length:N0}"));
+        long removed = 0;
+        int skippedByLimit = 0;
+        bool interruptedByInput = false;
         var complete = await RunWork("Выполняем очистку…", async token =>
         {
-            foreach (var item in plan)
+            await Task.Run(() =>
             {
-                token.ThrowIfCancellationRequested();
-                if (automatic && (!settings.Watch || !settings.AutoClean || !Idle()
-                    || System.Windows.Forms.SystemInformation.PowerStatus.PowerLineStatus != System.Windows.Forms.PowerLineStatus.Online)) break;
-                if (automatic && item.Bytes > limit - removed) continue;
-                var pending = new CleanupLog(DateTimeOffset.Now, item.Path, "Начато · проверьте состояние файла", 0);
-                journal.Add(pending);
-                if (!demo)
+                foreach (var item in plan)
                 {
-                    try { PersistJournal(); }
-                    catch (Exception error) when (error is IOException or UnauthorizedAccessException)
-                    {
-                        journal.Remove(pending);
-                        throw new IOException("Очистка остановлена. Не удалось записать журнал.", error);
-                    }
+                    token.ThrowIfCancellationRequested();
+                    if (automatic && (!settings.Watch || !settings.AutoClean || (!force && !Idle(60_000))))
+                    { interruptedByInput = true; break; }
+                    if (automatic && (!item.Automatic || item.Bytes > limit - removed))
+                    { skippedByLimit++; continue; }
+                    var result = Cleanup.Remove(item, days, exclusions);
+                    logs.Add(result);
+                    removed += result.Bytes;
+                    if (logs.Count % 24 == 0) ((IProgress<int>)progress).Report(logs.Count);
                 }
-                var result = await Task.Run(() => Cleanup.Remove(item, days, exclusions), CancellationToken.None);
-                journal.Remove(pending);
-                journal.Add(result);
-                if (!demo) PersistJournal();
-                removed += result.Bytes;
-            }
+            }, token);
         });
-        if (complete)
+
+        journal.AddRange(logs);
+        if (logs.Count > 0) TrySave(PersistJournal);
+        await RefreshVolumes(false);
+        var measured = volumes.Where(volume => volume.Ready && before.ContainsKey(volume.Id))
+            .Sum(volume => volume.Free - before[volume.Id]);
+        var successful = logs.Count(log => log.Status is "Удалён" or "Демо · имитация");
+        var skipped = logs.Count - successful + skippedByLimit;
+        var phase = complete && !interruptedByInput ? "Готово" : "Прервано";
+        cleanupResult = $"{phase} · удалено {successful:N0} ({Bytes(removed)}) · пропущено {skipped:N0}";
+        if (skippedByLimit > 0) cleanupResult += $" · лимит {skippedByLimit:N0}";
+        if (complete && !demo) cleanupResult += $" · свободное место {Diff(measured)}";
+        SetStatus(cleanupResult);
+        var removedPaths = logs.Where(log => log.Status is "Удалён" or "Демо · имитация")
+            .Select(log => log.Path).ToHashSet(StringComparer.OrdinalIgnoreCase);
+        if (candidates is not null) candidates = candidates.Where(item => !removedPaths.Contains(item.Path)).ToArray();
+        if (automatic)
         {
-            await RefreshVolumes(false);
-            var measured = volumes.Where(volume => volume.Ready && before.ContainsKey(volume.Id))
-                .Sum(volume => volume.Free - before[volume.Id]);
-            SetStatus($"Обработано {Bytes(removed)} · изменение свободного места {Diff(measured)}");
+            var finishedAt = DateTimeOffset.Now;
+            autoReport = new(finishedAt, plan.Length, removed, cleanupResult,
+                interruptedByInput || !complete ? finishedAt.AddMinutes(5) : null);
+            TrySave(() => store.Save("auto-cleanup.json", autoReport));
         }
-        candidates = null;
-        if (active == "Очистка" || active == "Обзор") Render();
+        if (active == "Очистка" || active == "Обзор" || active == "Настройки") Render();
     }
 
     private void PersistJournal()
@@ -77,6 +126,7 @@ public partial class MainWindow
     {
         public bool Selected { get => Item.Selected; set => Item.Selected = value; }
         public string Name => Item.Name;
+        public string Category => Item.Category;
         public string Path => Item.Path;
         public string Size => Bytes(Item.Bytes);
         public string Reason => Item.Reason;
@@ -91,45 +141,125 @@ public partial class MainWindow
         public string Date => MainWindow.Date(Item.Time);
     }
 
+
+    private string? cleanupCategory;
+
     private void RenderCleanup()
     {
-        Heading("Очистка", "Предпросмотр временных файлов и системные инструменты Windows");
+        Heading("Очистка", "Кеши, временные файлы и корзина");
+        var plan = candidates ?? [];
+        var summary = new Grid();
+        summary.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(1.25, GridUnitType.Star) });
+        summary.ColumnDefinitions.Add(new ColumnDefinition());
+        var estimate = new StackPanel();
+        AddText(estimate, previewAutomatic ? "Временные файлы и кеш шейдеров" : "Можно освободить");
+        estimate.Children.Add(Text(candidates is null ? "—" : Bytes(plan.Sum(item => item.Bytes)), 42, bold: true));
+        AddText(estimate, cleanupResult.Length == 0
+            ? candidates is null ? "Подготавливаем список при открытии раздела" : $"{plan.Length:N0} файлов в списке"
+            : cleanupResult, margin: new Thickness(0, 4, 12, 8));
         var actions = Actions();
-        actions.Children.Add(ActionButton("Найти, что можно очистить", async () => await FindCleanup(), true));
-        actions.Children.Add(ActionButton("Память Windows", () => { if (!demo) Cleanup.OpenWindowsCleanup(); }));
-        actions.Children.Add(ActionButton("Системная очистка", async () => await SystemCleanup()));
-        Page.Children.Add(actions);
-        var info = new StackPanel();
-        info.Children.Add(Text(candidates is null ? "План очистки" : Bytes(candidates.Sum(candidate => candidate.Bytes)) + " к просмотру", 21, bold: true));
-        AddText(info, candidates is null
-            ? $"Проверяем обычные .tmp в папке Temp текущего пользователя, которым больше {settings.MinimumAge} дней."
-            : $"{candidates.Length:N0} кандидатов. Выберите файлы для окончательного удаления.",
-            margin: new Thickness(0, 4, 0, 0));
-        Page.Children.Add(Card(info));
-        if (candidates is { Length: > 0 } plan)
+        actions.Children.Add(ActionButton("Проверить заново", async () => await FindCleanup()));
+        var run = ActionButton("Очистить выбранное…", async () => await ExecuteCleanup(plan.Where(item => item.Selected).ToArray()), true);
+        run.IsEnabled = plan.Any(item => item.Selected);
+        actions.Children.Add(run);
+        estimate.Children.Add(actions);
+        summary.Children.Add(estimate);
+        var auto = new StackPanel { Margin = new Thickness(16, 0, 0, 0) };
+        auto.Children.Add(Text("Автоочистка", 18, bold: true));
+        auto.Children.Add(Toggle("Запускать в простое", settings.AutoClean, SetAutoClean));
+        AddText(auto, cleanupRulesChanged ? "Подтвердите новые правила для автоочистки" : autoReport.Last == DateTimeOffset.MinValue ? autoReport.Result : $"{Date(autoReport.Last)} · {autoReport.Result}",
+            margin: new Thickness(0, 4, 0, 8));
+        var force = ActionButton("Запустить сейчас", async () => await RunAutoCleanup(force: true));
+        force.IsEnabled = settings.AutoClean;
+        force.HorizontalAlignment = HorizontalAlignment.Left;
+        auto.Children.Add(force);
+        Grid.SetColumn(auto, 1);
+        summary.Children.Add(auto);
+        Page.Children.Add(Card(summary));
+
+        var disposable = new StackPanel();
+        disposable.Children.Add(Text("Источники", 18, bold: true));
+        if (candidates is not null && plan.Length == 0)
+            AddText(disposable, "По выбранным правилам подходящих файлов нет. Проверьте корзину или откройте системную очистку.",
+                margin: new Thickness(0, 8, 0, 0));
+        foreach (var group in plan.GroupBy(item => item.Category).OrderByDescending(group => group.Sum(item => item.Bytes)))
         {
-            var rows = plan.Select(item => new CleanupRow(item)).ToArray();
-            var table = Table(rows, ("Файл", "Name", 210), ("На диске", "Size", 100), ("Изменён", "Date", 90),
-                ("Причина", "Reason", 300), ("Путь", "Path", 320));
-            table.IsReadOnly = false;
-            foreach (var column in table.Columns) column.IsReadOnly = true;
-            table.Columns.Insert(0, new DataGridCheckBoxColumn { Header = "Выбор", Width = 68,
-                Binding = new Binding(nameof(CleanupRow.Selected)) { Mode = BindingMode.TwoWay, UpdateSourceTrigger = UpdateSourceTrigger.PropertyChanged } });
-            Page.Children.Add(table);
-            var planActions = Actions();
-            planActions.Children.Add(ActionButton("Удалить выбранные…", async () =>
+            var items = group.ToArray();
+            var line = new DockPanel { Margin = new Thickness(0, 8, 0, 0) };
+            var selection = new CheckBox { Content = $"{group.Key} · {items.Length:N0} файлов",
+                IsChecked = items.All(item => item.Selected) ? true : items.All(item => !item.Selected) ? false : null,
+                VerticalAlignment = VerticalAlignment.Center };
+            selection.Click += (_, _) =>
             {
-                table.CommitEdit(DataGridEditingUnit.Cell, true);
-                table.CommitEdit(DataGridEditingUnit.Row, true);
-                await ExecuteCleanup(plan.Where(item => item.Selected).ToArray());
-            }, true));
-            planActions.Children.Add(ActionButton("Снять все отметки", () => { foreach (var item in plan) item.Selected = false; Render(); }));
-            Page.Children.Add(planActions);
+                foreach (var item in items) item.Selected = selection.IsChecked == true;
+                Render();
+            };
+            var details = ActionButton((cleanupCategory == group.Key ? "Скрыть · " : "Файлы · ") + Bytes(items.Sum(item => item.Bytes)),
+                () => { cleanupCategory = cleanupCategory == group.Key ? null : group.Key; Render(); });
+            DockPanel.SetDock(details, Dock.Right);
+            line.Children.Add(details);
+            line.Children.Add(selection);
+            disposable.Children.Add(line);
         }
-        Page.Children.Add(Text("Журнал очистки", 19, bold: true));
-        if (journal.Count == 0) AddText(Page, "Выполненных операций пока нет.", margin: new Thickness(0, 5, 0, 0));
+        if (cleanupCategory is not null)
+        {
+            var rows = plan.Where(item => item.Category == cleanupCategory).Select(item => new CleanupRow(item)).ToArray();
+            if (rows.Length != 0)
+            {
+                var table = Table(rows, ("Файл", "Name", 208), ("На диске", "Size", 108), ("Изменён", "Date", 96),
+                    ("Причина", "Reason", 280), ("Путь", "Path", 320));
+                table.MaxHeight = 292;
+                table.Margin = new Thickness(0, 12, 0, 8);
+                table.IsReadOnly = false;
+                foreach (var column in table.Columns) column.IsReadOnly = true;
+                var check = new FrameworkElementFactory(typeof(CheckBox));
+                check.SetBinding(System.Windows.Controls.Primitives.ToggleButton.IsCheckedProperty,
+                    new Binding(nameof(CleanupRow.Selected)) { Mode = BindingMode.TwoWay, UpdateSourceTrigger = UpdateSourceTrigger.PropertyChanged });
+                check.SetValue(HorizontalAlignmentProperty, HorizontalAlignment.Center);
+                check.AddHandler(CheckBox.ClickEvent, new RoutedEventHandler((_, _) => run.IsEnabled = plan.Any(item => item.Selected)));
+                table.Columns.Insert(0, new DataGridTemplateColumn { Header = "Выбор", Width = 64, CellTemplate = new DataTemplate { VisualTree = check } });
+                disposable.Children.Add(table);
+            }
+        }
+        Page.Children.Add(Card(disposable));
+
+        var system = new StackPanel();
+        system.Children.Add(Text("Корзина и Windows", 18, bold: true));
+        AddText(system, $"В корзине {Bytes(recycleContents.Bytes)} · {recycleContents.Count:N0} элементов",
+            margin: new Thickness(0, 4, 0, 12));
+        var tools = Actions();
+        tools.Children.Add(ActionButton("Открыть корзину", () => { if (!demo) Recycle.Open(); }));
+        tools.Children.Add(ActionButton("Очистить корзину…", async () => await EmptyRecycle()));
+        tools.Children.Add(ActionButton("Системная очистка", async () => await SystemCleanup()));
+        tools.Children.Add(ActionButton("Память Windows", () => { if (!demo) Cleanup.OpenWindowsCleanup(); }));
+        system.Children.Add(tools);
+        Page.Children.Add(Card(system));
+
+        Page.Children.Add(Text("Журнал очистки", 18, bold: true));
+        if (journal.Count == 0) AddText(Page, "Операций пока нет", margin: new Thickness(0, 4, 0, 0));
         else Page.Children.Add(Table(journal.AsEnumerable().Reverse().Take(200).Select(item => new LogRow(item)).ToArray(),
-            ("Время", "Date", 110), ("Результат", "Status", 265), ("Объём", "Size", 100), ("Путь", "Path", 450)));
+            ("Время", "Date", 112), ("Результат", "Status", 252), ("Объём", "Size", 96), ("Путь", "Path", 448)));
+    }
+
+    private async Task EmptyRecycle()
+    {
+        if (current is not null) { SetStatus("Сначала завершите текущую операцию"); return; }
+        if (demo) { recycleContents = (0, 0); cleanupResult = "Демо · очистка корзины"; Render(); return; }
+        var owner = new System.Windows.Interop.WindowInteropHelper(this).Handle;
+        var previous = recycleContents;
+        string? outcome = null;
+        var ok = await RunWork("Открыта очистка корзины Windows…", async _ =>
+            outcome = await Task.Run(() => Recycle.Empty(owner)));
+        recycleContents = await Task.Run(Recycle.Count);
+        if (ok)
+        {
+            cleanupResult = outcome ?? $"Корзина очищена · {Bytes(Math.Max(0, previous.Bytes - recycleContents.Bytes))}";
+            journal.Add(new(DateTimeOffset.Now, "Корзина Windows", cleanupResult, Math.Max(0, previous.Bytes - recycleContents.Bytes)));
+            TrySave(PersistJournal);
+            SetStatus(cleanupResult);
+        }
+        await RefreshVolumes(false);
+        Render();
     }
 
     private async Task SystemCleanup()
@@ -173,9 +303,9 @@ public partial class MainWindow
         var ruleActions = Actions();
         ruleActions.Children.Add(ActionButton("Изменить возраст", () =>
         {
-            if (int.TryParse(Prompt("Минимальный возраст, дней", settings.MinimumAge.ToString()), out var age) && age is >= 7 and <= 365)
+            if (int.TryParse(Prompt("Минимальный возраст, дней", settings.MinimumAge.ToString()), out var age) && age is >= 1 and <= 365)
             { candidates = null; Save(settings with { MinimumAge = age }); }
-            else SetStatus("Допустимый возраст — от 7 до 365 дней");
+            else SetStatus("Допустимый возраст — от 1 до 365 дней");
         }));
         ruleActions.Children.Add(ActionButton("Изменить лимит", () =>
         {
@@ -226,14 +356,21 @@ public partial class MainWindow
         return box;
     }
 
+
     private void SetAutoClean(bool enabled)
     {
-        if (enabled && candidates is null) { SetStatus("Сначала запустите поиск кандидатов в разделе «Очистка»"); Render(); return; }
         if (enabled && MessageBox.Show(this,
-            $"Разрешить автоматическое удаление подходящих .tmp в простое? Минимальный возраст {settings.MinimumAge} дней, лимит {settings.LimitMb} МБ за запуск.",
+            $"В простое приложение будет удалять подходящие временные файлы и кеш шейдеров.\nВозраст от {settings.MinimumAge} дней. Лимит {settings.LimitMb} МБ за запуск.",
             "Автоочистка", MessageBoxButton.YesNo, MessageBoxImage.Warning, MessageBoxResult.No) != MessageBoxResult.Yes)
         { Render(); return; }
-        Save(settings with { AutoClean = enabled, Watch = settings.Watch || enabled });
+        if (enabled && !settings.AutoClean)
+        {
+            autoReport = CleanupSchedule.Empty;
+            TrySave(() => store.Save("auto-cleanup.json", autoReport));
+        }
+        cleanupRulesChanged = false;
+        Save(settings with { AutoClean = enabled, Watch = settings.Watch || enabled, CleanupConsent = enabled ? 2 : 0 });
+        SetStatus(enabled ? "Автоочистка включена · сработает после минуты простоя" : "Автоочистка выключена");
     }
 
     private const string RunKey = @"Software\Microsoft\Windows\CurrentVersion\Run";
@@ -264,12 +401,14 @@ public partial class MainWindow
             "Удаление истории", MessageBoxButton.YesNo, MessageBoxImage.Question, MessageBoxResult.No) != MessageBoxResult.Yes) return;
         history.Clear();
         journal.Clear();
+        usage = new(DateTimeOffset.Now, new(StringComparer.OrdinalIgnoreCase));
+        autoReport = CleanupSchedule.Empty;
         scans.Clear();
         candidates = null;
         duplicateRows = null;
         TrySave(() =>
         {
-            foreach (var name in new[] { "history.json", "cleanup.json", "history.json.new", "cleanup.json.new" })
+            foreach (var name in new[] { "history.json", "cleanup.json", "usage.json", "auto-cleanup.json", "history.json.new", "cleanup.json.new", "usage.json.new" })
                 File.Delete(Path.Combine(store.Location, name));
         });
         Render();
@@ -291,6 +430,7 @@ public partial class MainWindow
         history = [];
         journal = [];
         candidates = DemoCandidates();
+        recycleContents = (188L * 1024 * 1024, 7);
         string[][] labels = [["Windows", "Пользователи", "Программы", "Временные файлы"],
             ["Игры", "Записи", "Проекты", "Кеш сборки"], ["Архивы", "Фотографии", "Резервные копии"]];
         foreach (var volume in volumes)
@@ -312,7 +452,9 @@ public partial class MainWindow
     private static Candidate[] DemoCandidates() =>
     [
         new(@"C:\Demo\Temp\media-index.tmp", 440_401_920, 440_401_000, DateTime.UtcNow.AddDays(-15), "Временный индекс · демо", true),
-        new(@"C:\Demo\Temp\installer.tmp", 175_112_192, 175_112_000, DateTime.UtcNow.AddDays(-18), "След установки · демо", true),
-        new(@"C:\Demo\Temp\render.tmp", 28_311_552, 28_311_000, DateTime.UtcNow.AddDays(-25), "Временный рендер · демо", true)
+        new(@"C:\Demo\DirectX\shader.bin", 175_112_192, 175_112_000, DateTime.UtcNow.AddDays(-18), "Кеш шейдеров · демо", true,
+            Rule: new(@"C:\Demo\DirectX", CleanupKind.Shader, "Кеш шейдеров DirectX")),
+        new(@"C:\Demo\Browser\data_1", 28_311_552, 28_311_000, DateTime.UtcNow.AddDays(-25), "Кеш браузера · демо", true,
+            Rule: new(@"C:\Demo\Browser", CleanupKind.Browser, "Кеш браузера"))
     ];
 }
